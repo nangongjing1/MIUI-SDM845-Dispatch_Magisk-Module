@@ -1,0 +1,232 @@
+#!/system/bin/sh
+# EAS parameter adjustment for SDM 845
+# Author: 南宫镜
+
+# --- 常量定义 ---
+C0_GOVERNOR_DIR="/sys/devices/system/cpu/cpu0/cpufreq/schedutil"
+C1_GOVERNOR_DIR="/sys/devices/system/cpu/cpu4/cpufreq/schedutil"
+C0_CPUFREQ_DIR="/sys/devices/system/cpu/cpu0/cpufreq"
+C1_CPUFLEQ_DIR="/sys/devices/system/cpu/cpu4/cpufreq"
+SCREEN_CHECK_INTERVAL=10  # 屏幕检测间隔(秒)
+LOG_FILE="/data/local/tmp/sdm845_tuner.log"
+
+# --- 初始化配置 ---
+CURRENT_MODE="${1:-balance}"
+SCREEN_STATE=0  # 0-Light up  1-Screen off
+DAEMON_PID=""
+
+# --- 日志记录函数 ---
+function log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $@" >> $LOG_FILE
+}
+
+# --- 重要函数改进 ---
+
+# 屏幕检测（添加失败处理）
+function detect_screen_state() {
+    # 探测方法1: 直接通过dumpsys
+    if dumpsys power 2>/dev/null | grep -q "mWakefulness=Asleep"; then
+        SCREEN_STATE=1
+        return 0
+    fi
+
+    # 探测方法2: 背光亮度文件（动态尝试可能路径）
+    BACKLIGHT_PATHS=(
+        "/sys/class/backlight/panel0-backlight/brightness"
+        "/sys/class/leds/lcd-backlight/brightness"
+        "/sys/class/backlight/backlight/brightness"
+    )
+    for path in "${BACKLIGHT_PATHS[@]}"; do
+        if [ -f "$path" ] && [ $(cat "$path" 2>/dev/null) -eq 0 ]; then
+            SCREEN_STATE=1
+            return 0
+        fi
+    done
+
+    SCREEN_STATE=0  # 其他情况判定为亮屏
+    return 1  # 未明确命中但按亮屏处理
+}
+
+# 动态保存当前调速参数
+function save_current_params() {
+    LITTLE_HISPEED_FREQ=$(cat $C0_GOVERNOR_DIR/hispeed_freq 2>/dev/null || echo "1280000")
+    LITTLE_HISPEED_LOAD=$(cat $C0_GOVERNOR_DIR/hispeed_load 2>/dev/null || echo "90")
+    BIG_HISPEED_FREQ=$(cat $C1_GOVERNOR_DIR/hispeed_freq 2>/dev/null || echo "1580000")
+}
+
+# 息屏省电核心函数 (添加防锁死机制)
+function apply_screen_off_profile() {
+    log "Entering screen-off power saving..."
+
+    # Online状态优雅关闭
+    for cpu in 4 5 6 7; do
+        if [ -f /sys/devices/system/cpu/cpu$cpu/online ]; then
+            echo 0 > /sys/devices/system/cpu/cpu$cpu/online && \
+            log "CPU$cpu set to offline"
+        fi
+    done
+
+    # 频率上限限制（带安全值）
+    safely_set_value "0:902000 4:0" /sys/module/msm_performance/parameters/cpu_max_freq
+    echo 902000 > $C0_GOVERNOR_DIR/hispeed_freq
+    echo 99 > $C0_GOVERNOR_DIR/hispeed_load
+
+    # IO调整（错误捕捉）
+    set_io noop /sys/block/sda || log "Failed to set sda scheduler"
+
+    # boost类参数禁用
+    [ -f /sys/module/cpu_boost/parameters/input_boost_enabled ] && \
+    echo 0 > /sys/module/cpu_boost/parameters/input_boost_enabled
+}
+
+# 亮屏恢复函数（模式自动匹配）
+function apply_normal_profile() {
+    log "Restoring profile: $CURRENT_MODE"
+
+    # 大核重新上线(跳过可能的错误)
+    for cpu in 4 5 6 7; do
+        if [ -f /sys/devices/system/cpu/cpu$cpu/online ]; then
+            echo 1 > /sys/devices/system/cpu/cpu$cpu/online >/dev/null 2>&1
+        fi
+    done
+
+    # 清除最大频率限制
+    safely_set_value "" /sys/module/msm_performance/parameters/cpu_max_freq
+
+    # 依据当前模式重新初始化
+    case "$CURRENT_MODE" in
+      "powersave") powersave_custom ;;
+      "balance") balance_custom ;;
+      "performance") performance_custom ;;
+      "fast") fast_custom ;;
+    esac
+
+    # 复位调度参数
+    echo $LITTLE_HISPEED_LOAD > $C0_GOVERNOR_DIR/hispeed_load
+    echo $LITTLE_HISPEED_FREQ > $C0_GOVERNOR_DIR/hispeed_freq
+}
+
+# 新增：安全设置函数(防止空值带来的错误)
+function safely_set_value() {
+    if [ -n "$1" ] && [ -f "$2" ]; then
+        echo "$1" > "$2" 2>>$LOG_FILE && \
+        log "Set $2=$1" || \
+        log "ERROR: set $2 failed"
+        return 0
+    fi
+    return 1
+}
+
+# --- 模式逻辑（修复路径错误) ---
+function powersave_custom() {
+    safely_set_value "0:1680000 4:1880000" /sys/module/msm_performance/parameters/cpu_max_freq
+    safely_set_value "0:1080000 4:0" /sys/module/cpu_boost/parameters/input_boost_freq
+    lock_value 2 /sys/devices/system/cpu/cpu4/core_ctl/min_cpus
+
+    set_param_little hispeed_freq 1180000
+    set_param_little hispeed_load 90
+    set_param_big hispeed_freq 1080000
+    set_param_big hispeed_load 90
+}
+
+function balance_custom() {
+    safely_set_value "0:2000000 4:2400000" /sys/module/msm_performance/parameters/cpu_max_freq
+    set_param_little hispeed_freq 1280000
+    set_param_little hispeed_load 85
+    set_param_big hispeed_freq 1530000  
+    set_param_big hispeed_load 85
+}
+
+function lock_value {
+    local value=$1
+    local path=$2
+    if [ -f $path ]; then
+        chmod 0666 $path && \
+        echo $value > $path && \
+        chmod 0444 $path
+    else
+        log "WARNING: $path does not exist!"
+    fi
+}
+
+# --- 守护进程管理 ---
+function start_background_daemon() {
+    # 终止可能的残余进程
+    pkill -f "sdm845_tuner.sh daemon"
+
+    # 进入后台检测循环
+    nohup sh $0 daemon 2>&1 >> $LOG_FILE &
+    DAEMON_PID=$!
+    [ -n "$DAEMON_PID" ] && log "Daemon started with PID: $DAEMON_PID"
+}
+
+function handle_screen_state() {
+    local previous=$SCREEN_STATE
+    detect_screen_state
+
+    if [ "$previous" != "$SCREEN_STATE" ]; then
+        if [ $SCREEN_STATE -eq 1 ]; then
+            save_current_params
+            apply_screen_off_profile
+        else
+            apply_normal_profile
+        fi
+    fi
+}
+
+# --- 原生命入口点 ---
+case "$1" in
+    "daemon")
+        renice -n 19 -p $$  # 降低优先级
+        log "Daemon started under $CURRENT_MODE mode"
+        while true; do
+            handle_screen_state 
+            sleep $SCREEN_CHECK_INTERVAL
+        done
+        exit 0  # 实际上循环会无限进行
+        ;;
+    *)
+        CURRENT_MODE=$1
+esac
+
+[ ! -f /tmp/tuner_init ] && {
+    # 首次处理初始化锁文件
+    > $LOG_FILE  # 清空旧日志
+    touch /tmp/tuner_init
+  
+    # 基础环境准备
+    unify_environment
+    before_modify
+    save_current_params  # 保存初始参数
+    
+    log "Initialization complete for $CURRENT_MODE mode"
+}
+
+case $CURRENT_MODE in
+    "powersave"|"balance"|"performance"|"fast"|"debug")
+        $CURRENT_MODE _custom 
+        verify_param ;;
+    *)
+        echo "Usage: $0 [powersave|balance|performance|fast|debug]" 
+        exit 1 ;;
+esac 
+
+# 启动后台管理进程（防止在初始化模式下运行）
+[ "$1" != "debug" ] && start_background_daemon
+
+# --------- 工具区 ---------
+function set_io() {
+    local scheduler=$1
+    local device=$2
+    if [ -f $device/queue/scheduler ]; then
+        if grep -q $scheduler $device/queue/scheduler; then
+            log "Setting $device scheduler to $scheduler"
+            echo $scheduler > $device/queue/scheduler
+            echo 512 > $device/queue/read_ahead_kb
+        else
+            log "Unsupported scheduler $scheduler for $device"
+        fi
+    fi
+}
+
+exit 0

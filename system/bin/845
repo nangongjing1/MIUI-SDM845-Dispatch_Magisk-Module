@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # EAS parameter adjustment for SDM 845
 # Author 南宫镜
-# Version 1.4
+# Version 1.5
 
 # --- 常量定义 ---
 C0_GOVERNOR_DIR="/sys/devices/system/cpu/cpu0/cpufreq/schedutil"
@@ -101,13 +101,9 @@ function apply_normal_profile() {
       "performance") performance_custom ;;
       "fast") fast_custom ;;
     esac
-
-    # 复位调度参数
-    echo $LITTLE_HISPEED_LOAD > $C0_GOVERNOR_DIR/hispeed_load
-    echo $LITTLE_HISPEED_FREQ > $C0_GOVERNOR_DIR/hispeed_freq
 }
 
-# 新增：安全设置函数(防止空值带来的错误)
+# 安全设置函数(防止空值带来的错误)
 function safely_set_value() {
     if [ -n "$1" ] && [ -f "$2" ]; then
         echo "$1" > "$2" 2>>$LOG_FILE && \
@@ -116,6 +112,17 @@ function safely_set_value() {
         return 0
     fi
     return 1
+}
+
+# --- 参数设置函数 ---
+function set_param_little() {
+    local param=$1 value=$2
+    safely_set_value $value $C0_GOVERNOR_DIR/$param
+}
+
+function set_param_big() {
+    local param=$1 value=$2
+    safely_set_value $value $C1_GOVERNOR_DIR/$param
 }
 
 # --- 模式逻辑 ---
@@ -138,16 +145,28 @@ function balance_custom() {
     set_param_big hispeed_load 85
 }
 
-function lock_value {
-    local value=$1
-    local path=$2
-    if [ -f $path ]; then
-        chmod 0666 $path && \
-        echo $value > $path && \
-        chmod 0444 $path
-    else
-        log "WARNING: $path does not exist!"
-    fi
+function performance_custom()
+{
+	safely_set_value "0:1780000 4:2880000" /sys/module/msm_performance/parameters/cpu_max_freq
+	safely_set_value "0:1180000 4:0" /sys/module/cpu_boost/parameters/input_boost_freq
+	lock_value 2 /sys/devices/system/cpu/cpu4/core_ctl/min_cpus
+	lock_value 4 /sys/devices/system/cpu/cpu4/core_ctl/max_cpus
+	set_param_little hispeed_freq 1380000
+	set_param_little hispeed_load 80
+	set_param_big hispeed_freq 1680000
+	set_param_big hispeed_load 80
+}
+
+function fast_custom()
+{
+	safely_set_value "0:1780000 4:2280000" /sys/module/msm_performance/parameters/cpu_max_freq
+	safely_set_value "0:1480000 4:1680000" /sys/module/cpu_boost/parameters/input_boost_freq
+	lock_value 4 /sys/devices/system/cpu/cpu4/core_ctl/min_cpus
+	lock_value 4 /sys/devices/system/cpu/cpu4/core_ctl/max_cpus
+	set_param_little hispeed_freq 1480000
+	set_param_little hispeed_load 70
+	set_param_big hispeed_freq 1880000
+	set_param_big hispeed_load 70
 }
 
 # --- 守护进程管理 ---
@@ -184,7 +203,7 @@ case "$1" in
             handle_screen_state 
             sleep $SCREEN_CHECK_INTERVAL
         done
-        exit 0  # 实际上循环会无限进行
+        exit 0
         ;;
     *)
         CURRENT_MODE=$1
@@ -196,8 +215,6 @@ esac
     touch /tmp/tuner_init
 
     # 基础环境准备
-    unify_environment
-    before_modify
     save_current_params  # 保存初始参数
     
     log "Initialization complete for $CURRENT_MODE mode"
@@ -229,6 +246,19 @@ function set_io() {
         fi
     fi
 }
+
+function lock_value {
+    local value=$1
+    local path=$2
+    if [ -f $path ]; then
+        chmod 0666 $path && \
+        echo $value > $path && \
+        chmod 0444 $path
+    else
+        log "WARNING: $path does not exist!"
+    fi
+}
+
 function verify_param() {
     target_path="${C0_GOVERNOR_DIR}/hispeed_freq"
     current_val=$(cat $target_path 2>/dev/null)

@@ -1,6 +1,6 @@
 id=MIUI_SDM845_Dispatch
 name=MIUI骁龙845调度
-version=v1.5
-versionCode=250602
+version=v1.6
+versionCode=250603
 author=南宫镜
 description=骁龙845均衡调度，关闭I/O统计，关闭LMK调试日志，关闭Ramdump，优化息屏功耗。
